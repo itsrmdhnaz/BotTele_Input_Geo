@@ -1,0 +1,253 @@
+// dokumentasi bot api telegram
+// https://core.telegram.org/bots/api
+
+// dokumentasi appscript for drive 
+// https://developers.google.com/apps-script/reference/drive?hl=id
+
+
+var token = "token_bot"; // Ganti dengan token bot Anda
+var apiUrl = "https://api.telegram.org/bot" + token + "/";
+var webUrl = "web app url setelah deploy dengan webapp url baru"
+var sheetID = "Sheet id"; //https://docs.google.com/spreadsheets/d/sheetId/edit#gid=0 sheet id pada sprreadsheet diambil sheetIdnya 
+var sheet = SpreadsheetApp.openById(sheetID).getSheetByName('Geo'); 
+var driveFolderId = "drive id"; //https://drive.google.com/drive/folders/driveFolderId pada link driver diambil driveFolderId 
+
+// buat header pada spreadsheet
+// Timestamp	| ID Telegram	 | Username |	Event	| Alamat	| Foto	| File name |	GeoCode |	GeoAddress
+
+// buat update bot nya jalankan function setWebHook setiap ada perubahan
+function setWebhook() {
+  var response = UrlFetchApp.fetch(apiUrl + "setWebhook?url=" + webUrl);
+  Logger.log(response.getContentText());
+}
+
+
+function doPost(e) {
+  var data = JSON.parse(e.postData.contents);
+
+  if (data.message) {
+    var chatId = data.message.chat.id;
+    var idUser = data.message.from.id;
+    var username = data.message.from.username || data.message.from.first_name;
+    var text = data.message.text;
+    var messageId = data.message.message_id;
+
+    if (text == "/start") {
+      var responseText = "Halo selamat datang di Geo Puwokerto. Untuk input, kirimkan foto beserta caption, atau bagikan lokasi Anda.";
+      sendReply(chatId, responseText, messageId);
+    }
+
+    if (data.message.document || data.message.photo) {
+      var isInputAllowed = isInputDocumentOrPhotoAllowed(idUser);
+
+      // Kirim pesan loading
+      var loadingMessageId = sendLoadingMessage(chatId);
+
+      if (!isInputAllowed) {
+        // Hapus pesan loading jika input tidak diizinkan
+        deleteLoadingMessage(chatId, loadingMessageId);
+        sendReply(chatId, "Anda harus menyelesaikan input yang pertama sebelum mengirim yang baru.", messageId);
+        return;
+      }
+
+      var file_id = data.message.document ? data.message.document.file_id : data.message.photo[3].file_id;
+      var nameFile = data.message.document ? data.message.document.file_name : null;
+      var caption = (data.message.caption || "No Caption") || (data.message.caption || data.message.document ? nameFile.split("_") : "No Caption");
+      var fileUrl = sendDownloadUrl(file_id, nameFile, caption);
+
+      if (!fileUrl) {
+        // Hapus pesan loading jika input gagal
+        deleteLoadingMessage(chatId, loadingMessageId);
+        sendReply(chatId, "Input data gagal ❌, Mohon untuk mengirim ulang.", messageId);
+        return;
+      }
+
+      var validate = saveToGSheet(idUser, username, caption, fileUrl, nameFile);
+
+      // Hapus pesan loading setelah validasi selesai
+      deleteLoadingMessage(chatId, loadingMessageId);
+
+      if (!validate) {
+        sendReply(chatId, "Input data gagal ❌, Mohon untuk mengirim ulang.", messageId);
+      }
+    }
+
+    if (data.message.location) {
+      var lat = data.message.location.latitude;
+      var lng = data.message.location.longitude;
+      var geoAddressNew = getGeoAddress(lat, lng);
+      var rowForLocation = getValidLocationRow(idUser);
+
+      var loadingMessageId = sendLoadingMessage(chatId); // Kirim pesan loading dan dapatkan ID pesan
+
+
+      if (rowForLocation !== -1) {
+
+        var validate2 = appendHI({
+          lat: lat,
+          lng: lng,
+        }, geoAddressNew, rowForLocation);
+
+        deleteLoadingMessage(chatId, loadingMessageId); // Hapus pesan loading setelah selesai
+
+        if (validate2) {
+          sendReply(chatId, 'Input data berhasil ✅, Terima kasih.', messageId);
+        } else {
+          sendReply(chatId, "Input data gagal ❌, Mohon untuk mengirim ulang lokasi.", messageId);
+        }
+      } else {
+        sendReply(chatId, "Anda harus menyelesaikan input yang pertama sebelum mengirim lokasi baru.", messageId);
+      }
+    }
+
+  }
+}
+
+// Fungsi untuk mengirim pesan loading dan mengembalikan ID pesan
+function sendLoadingMessage(chatId) {
+  var payload = {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify({
+      chat_id: chatId,
+      text: "Loading...",
+    }),
+  };
+
+  var response = UrlFetchApp.fetch(apiUrl + "sendMessage", payload);
+  var responseData = JSON.parse(response.getContentText());
+  return responseData.result.message_id;
+}
+
+// Fungsi untuk menghapus pesan loading berdasarkan ID pesan
+function deleteLoadingMessage(chatId, messageId) {
+  var payload = {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify({
+      chat_id: chatId,
+      message_id: messageId,
+    }),
+  };
+
+  UrlFetchApp.fetch(apiUrl + "deleteMessage", payload);
+}
+
+function sendDownloadUrl(file_id, nameFile, caption) {
+  var now = new Date();
+  var timestamps = Utilities.formatDate(now, "Asia/Jakarta", "dd/MM/YYYY HH:mm:ss");
+  var photoUrl = apiUrl + 'getFile?file_id=' + file_id;
+  var response = UrlFetchApp.fetch(photoUrl);
+  var fileData = JSON.parse(response.getContentText());
+
+  var fileUrl = 'https://api.telegram.org/file/bot' + token + '/' + fileData.result.file_path;
+  var photoData = UrlFetchApp.fetch(fileUrl)
+
+  var folder = DriveApp.getFolderById(driveFolderId);
+  var file = folder.createFile(photoData.getBlob());
+  file.setName(nameFile || (caption + "_" + timestamps + '.jpeg'));
+
+  return file.getDownloadUrl();
+}
+
+function saveToGSheet(id, username, caption, photoUrl, nameFile) {
+  var now = new Date();
+  var timestamps = Utilities.formatDate(now, "Asia/Jakarta", "dd/MM/YYYY HH:mm:ss");
+  var event = caption.split("_")[0] || caption.split("-")[0] || caption;
+  var alamat = caption.split("_")[1] || caption.split("-")[1] || caption;
+  var inputGSheet = sheet.appendRow([timestamps, id, username, event, alamat, photoUrl, nameFile || (caption + "_" + timestamps + '.jpeg')]);
+
+  if (inputGSheet) {
+    return true;
+  } else {
+    return false;
+  }
+}
+
+function appendHI(geoCode = { lat: "43943", lng: "82363" }, geoAddress = "asnsak", targetRow = getValidLocationRow("6670614492")) {
+  var dataH = geoCode.lat + "," + geoCode.lng;
+  var dataI = geoAddress;
+
+  var sheetH = sheet.getRange(targetRow, 8).setValue(dataH); // Kolom F
+  sheet.getRange(targetRow, 9).setValue(dataI); // Kolom G
+
+  if (sheetH) {
+    return true;
+  } else {
+    return false;
+  }
+}
+
+function getGeoAddress(lat, long) {
+  var geocoder = Maps.newGeocoder();
+  var result = geocoder.reverseGeocode(lat, long);
+
+  var address = result.results[0].formatted_address;
+  return address;
+}
+
+function sendReply(chatId, text, replyToMessageId) {
+  var payload = {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify({
+      chat_id: chatId,
+      text: text,
+      reply_to_message_id: replyToMessageId,
+    }),
+  };
+
+  var response = UrlFetchApp.fetch(apiUrl + "sendMessage", payload);
+}
+
+function sendMessage(chatId, text) {
+  var payload = {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify({
+      chat_id: chatId,
+      text: text,
+    }),
+  };
+
+  var response = UrlFetchApp.fetch(apiUrl + "sendMessage", payload);
+}
+
+function isInputDocumentOrPhotoAllowed(idUser = "6670614492") {
+  var lastRow = sheet.getLastRow();
+  var numRowsToCheck = lastRow >= 100 ? 100 : lastRow;
+
+  if (numRowsToCheck <= 0) {
+    return true;
+  }
+
+  var data = sheet.getRange(lastRow - numRowsToCheck + 1, 2, numRowsToCheck, 1).getValues();
+  for (var i = 0; i < numRowsToCheck; i++) {
+    if (data[i][0] == idUser && sheet.getRange(lastRow - numRowsToCheck + 1 + i, 8).getValue() === "") {
+      // Logger.log(false);
+      return false;
+    }
+  }
+  // Logger.log(true)
+  return true;
+}
+
+function getValidLocationRow(idUser = "6670614492") {
+  var lastRow = sheet.getLastRow();
+
+  var numRowsToCheck = lastRow >= 100 ? 100 : lastRow;
+
+  if (numRowsToCheck <= 0) {
+    return -1;
+  }
+
+  var data = sheet.getRange(lastRow - numRowsToCheck + 1, 2, numRowsToCheck, 1).getValues();
+  for (var i = 0; i < numRowsToCheck; i++) {
+    if (data[i][0] == idUser && sheet.getRange(lastRow - numRowsToCheck + 1 + i, 8).getValue() === "") {
+      // Logger.log(lastRow - numRowsToCheck + 1 + i)
+      return lastRow - numRowsToCheck + 1 + i;
+    }
+  }
+  // Logger.log("tidak ada")
+  return -1;
+}
